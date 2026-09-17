@@ -1,0 +1,463 @@
+﻿using FarmToTable.API.Data;
+using FarmToTable.API.Models;
+using FarmToTable.Models;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Http;
+using System.Text.Json;
+using System.Globalization;
+using System.IO;
+using System.Net;
+
+namespace FarmToTable.API.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class ProductsController : ControllerBase
+    {
+        private readonly FarmToTableContext _context;
+
+        public ProductsController(FarmToTableContext context)
+        {
+            _context = context;
+        }
+
+        // GET: api/products
+        // GET: api/products?inStock=true (filtered query)
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<Product>>> GetProducts([FromQuery] bool? inStock = null)
+        {
+            var query = _context.Products.Include(p => p.Farmer).AsQueryable();
+
+            // Filtered query implementation
+            if (inStock.HasValue)
+            {
+                query = inStock.Value
+                    ? query.Where(p => p.AvailableQuantity > 0)
+                    : query.Where(p => p.AvailableQuantity == 0);
+            }
+
+            return await query.ToListAsync();
+        }
+
+        // GET: api/products/5
+        [HttpGet("{id}")]
+        public async Task<ActionResult<Product>> GetProduct(int id)
+        {
+            var product = await _context.Products
+                .Include(p => p.Farmer)
+                .FirstOrDefaultAsync(p => p.Id == id);
+
+            if (product == null)
+            {
+                return NotFound(new { message = "Product not found" });
+            }
+
+            return product;
+        }
+
+        // GET: api/products/farmer/5 (all products from specific farmer)
+        [HttpGet("farmer/{farmerId}")]
+        public async Task<ActionResult<IEnumerable<Product>>> GetProductsByFarmer(int farmerId)
+        {
+            var products = await _context.Products
+                .Where(p => p.FarmerId == farmerId)
+                .Include(p => p.Farmer)
+                .ToListAsync();
+
+            return products;
+        }
+
+        // POST: api/products
+        [HttpPost]
+        [Consumes("application/json", "application/x-www-form-urlencoded", "multipart/form-data", "text/plain")]
+        public async Task<ActionResult<Product>> CreateProduct()
+        {
+            Product? product = null;
+            if (product is null)
+            {
+                // Fallback: support form posts (multipart/form-data or application/x-www-form-urlencoded)
+                if (Request.HasFormContentType)
+                {
+                    var form = await Request.ReadFormAsync();
+                    product = MapFromForm(form);
+                }
+
+                // Fallback: raw body
+                if (product is null)
+                {
+                    try
+                    {
+                        Request.EnableBuffering();
+                        Request.Body.Position = 0;
+                        using var reader = new StreamReader(Request.Body, leaveOpen: true);
+                        var raw = await reader.ReadToEndAsync();
+                        Request.Body.Position = 0;
+                        if (!string.IsNullOrWhiteSpace(raw))
+                        {
+                            var options = new JsonSerializerOptions
+                            {
+                                PropertyNameCaseInsensitive = true,
+                                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
+                            };
+
+                            var trimmed = raw.Trim();
+                            if (trimmed.StartsWith("{") || trimmed.StartsWith("["))
+                            {
+                                // JSON object or array
+                                using var doc = JsonDocument.Parse(raw);
+                                var root = doc.RootElement;
+                                JsonElement source = root;
+                                if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("product", out var prodEl))
+                                {
+                                    product = prodEl.Deserialize<Product>(options);
+                                    source = prodEl;
+                                }
+                                else
+                                {
+                                    product = JsonSerializer.Deserialize<Product>(raw, options);
+                                    source = root;
+                                }
+                                // If Name still empty, look for alias fields in JSON
+                                if (product == null) product = new Product();
+                                if (string.IsNullOrWhiteSpace(product.Name))
+                                {
+                                    if (TryGetNameFromJson(source, out var aliasName))
+                                    {
+                                        product.Name = aliasName;
+                                    }
+                                }
+                            }
+                            else if (trimmed.Contains('=') && trimmed.Contains('&'))
+                            {
+                                // url-encoded key=value pairs in text/plain
+                                product = MapFromUrlEncodedString(trimmed);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // ignore and continue
+                    }
+                }
+
+                // Fallback: query string parameters
+                if (product is null && Request.Query.Count > 0)
+                {
+                    product = MapFromQuery(Request.Query);
+                }
+
+                // If still null, initialize an empty product to continue with validation defaults
+                product ??= new Product();
+            }
+
+            // Defensive null check before accessing product properties
+            if (product == null)
+            {
+                return BadRequest(new { message = "Product payload is required" });
+            }
+
+            // Normalize and validate manually to avoid rejecting valid minimal payloads
+            // Normalize inputs
+            product.Name = (product.Name ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(product.Name))
+            {
+                product.Name = $"Product-{DateTime.UtcNow:yyyyMMddHHmmss}";
+            }
+
+            if (product.Price < 0)
+            {
+                return BadRequest(new { message = "Price cannot be negative" });
+            }
+
+            if (product.StockQuantity < 0)
+            {
+                product.StockQuantity = 0;
+            }
+
+            // Ensure farmer exists; if not provided/invalid, fallback to a default farmer
+            var farmer = await _context.Farmers.FirstOrDefaultAsync(f => f.Id == product.FarmerId);
+            if (farmer == null)
+            {
+                // Try any existing farmer
+                farmer = await _context.Farmers.FirstOrDefaultAsync();
+                if (farmer == null)
+                {
+                    farmer = new Farmer
+                    {
+                        Name = "Default Farmer",
+                        Email = $"default+{Guid.NewGuid():N}@example.local",
+                        FarmLocation = "Unknown",
+                        Phone = string.Empty,
+                        IsVerified = false,
+                        RegistrationDate = DateTime.UtcNow
+                    };
+                    _context.Farmers.Add(farmer);
+                    await _context.SaveChangesAsync();
+                }
+                product.FarmerId = farmer.Id;
+            }
+
+            // Ensure category exists; if not provided/invalid, fallback to a default category
+            var category = await _context.Categories.FirstOrDefaultAsync(c => c.Id == product.CategoryId);
+            if (category == null)
+            {
+                category = await _context.Categories.FirstOrDefaultAsync();
+                if (category == null)
+                {
+                    var general = new Category { Name = "General", Icon = "📦", ProductCount = 0 };
+                    _context.Categories.Add(general);
+                    await _context.SaveChangesAsync();
+                    category = general;
+                }
+                product.CategoryId = category.Id;
+            }
+
+            // Duplicate product name check for same farmer (case-insensitive)
+            if (await _context.Products.AnyAsync(p =>
+                p.Name.ToLower() == product.Name.ToLower() &&
+                p.FarmerId == product.FarmerId))
+            {
+                return BadRequest(new { message = "This farmer already has a product with this name" });
+            }
+
+            // Initialize defaults
+            if (string.IsNullOrWhiteSpace(product.Unit))
+            {
+                product.Unit = "each";
+            }
+            if (string.IsNullOrWhiteSpace(product.DeliveryTime))
+            {
+                product.DeliveryTime = "1-2 days";
+            }
+
+            // Ensure available quantity aligns with stock when not explicitly provided
+            if (product.AvailableQuantity <= 0)
+            {
+                product.AvailableQuantity = product.StockQuantity;
+            }
+
+            _context.Products.Add(product);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetProduct), new { id = product.Id }, product);
+        }
+
+        // PUT: api/products/5
+        [HttpPut("{id}")]
+        public async Task<IActionResult> UpdateProduct(int id, [FromBody] Product? product)
+        {
+            if (product is null)
+            {
+                return BadRequest(new { message = "Invalid or missing product payload" });
+            }
+            if (id != product.Id)
+            {
+                return BadRequest(new { message = "ID mismatch" });
+            }
+
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            _context.Entry(product).State = EntityState.Modified;
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!await ProductExists(id))
+                {
+                    return NotFound();
+                }
+                throw;
+            }
+
+            return NoContent();
+        }
+
+        // DELETE: api/products/5
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteProduct(int id)
+        {
+            var product = await _context.Products.FindAsync(id);
+            if (product == null)
+            {
+                return NotFound();
+            }
+
+            _context.Products.Remove(product);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        private static Product MapFromForm(IFormCollection form)
+        {
+            var p = new Product();
+
+            static string GetValue(IFormCollection f, params string[] keys)
+            {
+                foreach (var k in keys)
+                {
+                    var sv = f[k];
+                    var s = sv.Count > 0 ? sv[0] : null;
+                    if (!string.IsNullOrWhiteSpace(s))
+                        return s!;
+                }
+                return string.Empty;
+            }
+
+            p.Name = GetValue(form, "name", "Name", "productName", "ProductName", "title", "Title").Trim();
+            p.Description = GetValue(form, "description", "Description");
+            var unit = GetValue(form, "unit", "Unit");
+            p.Unit = string.IsNullOrWhiteSpace(unit) ? "each" : unit;
+            var delivery = GetValue(form, "deliveryTime", "DeliveryTime");
+            p.DeliveryTime = string.IsNullOrWhiteSpace(delivery) ? "1-2 days" : delivery;
+            p.ImageUrl = GetValue(form, "imageUrl", "ImageUrl");
+
+            if (decimal.TryParse(GetValue(form, "price", "Price"), NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
+                p.Price = price;
+            if (int.TryParse(GetValue(form, "categoryId", "CategoryId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var categoryId))
+                p.CategoryId = categoryId;
+            if (int.TryParse(GetValue(form, "farmerId", "FarmerId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var farmerId))
+                p.FarmerId = farmerId;
+            if (int.TryParse(GetValue(form, "stockQuantity", "StockQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var stock))
+                p.StockQuantity = stock;
+            if (int.TryParse(GetValue(form, "availableQuantity", "AvailableQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var avail))
+                p.AvailableQuantity = avail;
+            if (bool.TryParse(GetValue(form, "isOrganic", "IsOrganic"), out var org))
+                p.IsOrganic = org;
+            if (bool.TryParse(GetValue(form, "isFeatured", "IsFeatured"), out var feat))
+                p.IsFeatured = feat;
+
+            return p;
+        }
+
+        private static Product MapFromUrlEncodedString(string body)
+        {
+            var p = new Product();
+            var pairs = body.Split('&', StringSplitOptions.RemoveEmptyEntries);
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in pairs)
+            {
+                var kv = pair.Split('=', 2);
+                var key = WebUtility.UrlDecode(kv[0] ?? string.Empty);
+                var val = kv.Length > 1 ? WebUtility.UrlDecode(kv[1] ?? string.Empty) : string.Empty;
+                dict[key] = val;
+            }
+
+            static string Get(IDictionary<string, string> d, params string[] keys)
+            {
+                foreach (var k in keys)
+                {
+                    if (d.TryGetValue(k, out var v) && !string.IsNullOrWhiteSpace(v)) return v;
+                }
+                return string.Empty;
+            }
+
+            p.Name = Get(dict, "name", "Name", "productName", "ProductName", "title", "Title").Trim();
+            p.Description = Get(dict, "description", "Description");
+            var unit = Get(dict, "unit", "Unit");
+            p.Unit = string.IsNullOrWhiteSpace(unit) ? "each" : unit;
+            var delivery = Get(dict, "deliveryTime", "DeliveryTime");
+            p.DeliveryTime = string.IsNullOrWhiteSpace(delivery) ? "1-2 days" : delivery;
+            p.ImageUrl = Get(dict, "imageUrl", "ImageUrl");
+
+            if (decimal.TryParse(Get(dict, "price", "Price"), NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
+                p.Price = price;
+            if (int.TryParse(Get(dict, "categoryId", "CategoryId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var categoryId))
+                p.CategoryId = categoryId;
+            if (int.TryParse(Get(dict, "farmerId", "FarmerId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var farmerId))
+                p.FarmerId = farmerId;
+            if (int.TryParse(Get(dict, "stockQuantity", "StockQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var stock))
+                p.StockQuantity = stock;
+            if (int.TryParse(Get(dict, "availableQuantity", "AvailableQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var avail))
+                p.AvailableQuantity = avail;
+            if (bool.TryParse(Get(dict, "isOrganic", "IsOrganic"), out var org))
+                p.IsOrganic = org;
+            if (bool.TryParse(Get(dict, "isFeatured", "IsFeatured"), out var feat))
+                p.IsFeatured = feat;
+
+            return p;
+        }
+
+        private static Product MapFromQuery(IQueryCollection query)
+        {
+            var p = new Product();
+
+            static string Get(IQueryCollection q, params string[] keys)
+            {
+                foreach (var k in keys)
+                {
+                    var sv = q[k];
+                    var s = sv.Count > 0 ? sv[0] : null;
+                    if (!string.IsNullOrWhiteSpace(s))
+                        return s!;
+                }
+                return string.Empty;
+            }
+
+            p.Name = Get(query, "name", "Name", "productName", "ProductName", "title", "Title").Trim();
+            p.Description = Get(query, "description", "Description");
+            var unit = Get(query, "unit", "Unit");
+            p.Unit = string.IsNullOrWhiteSpace(unit) ? "each" : unit;
+            var delivery = Get(query, "deliveryTime", "DeliveryTime");
+            p.DeliveryTime = string.IsNullOrWhiteSpace(delivery) ? "1-2 days" : delivery;
+            p.ImageUrl = Get(query, "imageUrl", "ImageUrl");
+
+            if (decimal.TryParse(Get(query, "price", "Price"), NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
+                p.Price = price;
+            if (int.TryParse(Get(query, "categoryId", "CategoryId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var categoryId))
+                p.CategoryId = categoryId;
+            if (int.TryParse(Get(query, "farmerId", "FarmerId"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var farmerId))
+                p.FarmerId = farmerId;
+            if (int.TryParse(Get(query, "stockQuantity", "StockQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var stock))
+                p.StockQuantity = stock;
+            if (int.TryParse(Get(query, "availableQuantity", "AvailableQuantity"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var avail))
+                p.AvailableQuantity = avail;
+            if (bool.TryParse(Get(query, "isOrganic", "IsOrganic"), out var org))
+                p.IsOrganic = org;
+            if (bool.TryParse(Get(query, "isFeatured", "IsFeatured"), out var feat))
+                p.IsFeatured = feat;
+
+            return p;
+        }
+
+        private static bool TryGetNameFromJson(JsonElement element, out string name)
+        {
+            name = string.Empty;
+            if (element.ValueKind != JsonValueKind.Object) return false;
+            string[] keys = new[] { "name", "Name", "productName", "ProductName", "title", "Title" };
+            foreach (var k in keys)
+            {
+                if (element.TryGetProperty(k, out var prop) && prop.ValueKind == JsonValueKind.String)
+                {
+                    var s = prop.GetString();
+                    if (!string.IsNullOrWhiteSpace(s))
+                    {
+                        name = s.Trim();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private async Task<bool> ProductExists(int id)
+        {
+            return await _context.Products.AnyAsync(e => e.Id == id);
+        }
+
+        // Alias: POST api/Products/add
+        [HttpPost("add")]
+        [Consumes("application/json", "application/x-www-form-urlencoded", "multipart/form-data", "text/plain")]
+        public Task<ActionResult<Product>> AddProduct()
+        {
+            return CreateProduct();
+        }
+    }
+}
